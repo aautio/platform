@@ -197,7 +197,7 @@ func CreateWebhookPost(userId, teamId, channelId, text, overrideUsername, overri
 
 func CreateIncomingWebhookForChannel(creatorId string, channel *model.Channel, hook *model.IncomingWebhook) (*model.IncomingWebhook, *model.AppError) {
 	if !utils.Cfg.ServiceSettings.EnableIncomingWebhooks {
-		return nil, model.NewAppError("CreateIncomingWebhookForChannel", "api.webhook.create_incoming.disabled.app_errror", nil, "", http.StatusNotImplemented)
+		return nil, model.NewAppError("CreateIncomingWebhookForChannel", "api.incoming_webhook.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
 	hook.UserId = creatorId
@@ -212,7 +212,7 @@ func CreateIncomingWebhookForChannel(creatorId string, channel *model.Channel, h
 
 func DeleteIncomingWebhook(hookId string) *model.AppError {
 	if !utils.Cfg.ServiceSettings.EnableIncomingWebhooks {
-		return model.NewAppError("DeleteIncomingWebhook", "api.webhook.delete_incoming.disabled.app_errror", nil, "", http.StatusNotImplemented)
+		return model.NewAppError("DeleteIncomingWebhook", "api.incoming_webhook.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
 	if result := <-Srv.Store.Webhook().DeleteIncoming(hookId, model.GetMillis()); result.Err != nil {
@@ -225,6 +225,10 @@ func DeleteIncomingWebhook(hookId string) *model.AppError {
 }
 
 func GetIncomingWebhook(hookId string) (*model.IncomingWebhook, *model.AppError) {
+	if !utils.Cfg.ServiceSettings.EnableIncomingWebhooks {
+		return nil, model.NewAppError("GetIncomingWebhook", "api.incoming_webhook.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
 	if result := <-Srv.Store.Webhook().GetIncoming(hookId, true); result.Err != nil {
 		return nil, result.Err
 	} else {
@@ -234,7 +238,7 @@ func GetIncomingWebhook(hookId string) (*model.IncomingWebhook, *model.AppError)
 
 func GetIncomingWebhooksForTeamPage(teamId string, page, perPage int) ([]*model.IncomingWebhook, *model.AppError) {
 	if !utils.Cfg.ServiceSettings.EnableIncomingWebhooks {
-		return nil, model.NewAppError("GetIncomingWebhooksForTeamPage", "api.webhook.get_incoming.disabled.app_error", nil, "", http.StatusNotImplemented)
+		return nil, model.NewAppError("GetIncomingWebhooksForTeamPage", "api.incoming_webhook.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
 	if result := <-Srv.Store.Webhook().GetIncomingByTeam(teamId, page*perPage, perPage); result.Err != nil {
@@ -246,7 +250,7 @@ func GetIncomingWebhooksForTeamPage(teamId string, page, perPage int) ([]*model.
 
 func GetIncomingWebhooksPage(page, perPage int) ([]*model.IncomingWebhook, *model.AppError) {
 	if !utils.Cfg.ServiceSettings.EnableIncomingWebhooks {
-		return nil, model.NewAppError("GetIncomingWebhooksPage", "api.webhook.get_incoming.disabled.app_error", nil, "", http.StatusNotImplemented)
+		return nil, model.NewAppError("GetIncomingWebhooksPage", "api.incoming_webhook.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
 	if result := <-Srv.Store.Webhook().GetIncomingList(page*perPage, perPage); result.Err != nil {
@@ -258,7 +262,7 @@ func GetIncomingWebhooksPage(page, perPage int) ([]*model.IncomingWebhook, *mode
 
 func CreateOutgoingWebhook(hook *model.OutgoingWebhook) (*model.OutgoingWebhook, *model.AppError) {
 	if !utils.Cfg.ServiceSettings.EnableOutgoingWebhooks {
-		return nil, model.NewAppError("CreateOutgoingWebhook", "api.webhook.create_outgoing.disabled.app_error", nil, "", http.StatusNotImplemented)
+		return nil, model.NewAppError("CreateOutgoingWebhook", "api.outgoing_webhook.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
 	if len(hook.ChannelId) != 0 {
@@ -272,7 +276,7 @@ func CreateOutgoingWebhook(hook *model.OutgoingWebhook) (*model.OutgoingWebhook,
 		}
 
 		if channel.Type != model.CHANNEL_OPEN {
-			return nil, model.NewAppError("CreateOutgoingWebhook", "api.webhook.create_outgoing.not_open.app_error", nil, "", http.StatusForbidden)
+			return nil, model.NewAppError("CreateOutgoingWebhook", "api.outgoing_webhook.disabled.app_error", nil, "", http.StatusForbidden)
 		}
 
 		if channel.Type != model.CHANNEL_OPEN || channel.TeamId != hook.TeamId {
@@ -305,6 +309,10 @@ func CreateOutgoingWebhook(hook *model.OutgoingWebhook) (*model.OutgoingWebhook,
 }
 
 func GetOutgoingWebhook(hookId string) (*model.OutgoingWebhook, *model.AppError) {
+	if !utils.Cfg.ServiceSettings.EnableOutgoingWebhooks {
+		return nil, model.NewAppError("GetOutgoingWebhook", "api.outgoing_webhook.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
 	if result := <-Srv.Store.Webhook().GetOutgoing(hookId); result.Err != nil {
 		return nil, result.Err
 	} else {
@@ -314,7 +322,7 @@ func GetOutgoingWebhook(hookId string) (*model.OutgoingWebhook, *model.AppError)
 
 func GetOutgoingWebhooksForTeamPage(teamId string, page, perPage int) ([]*model.OutgoingWebhook, *model.AppError) {
 	if !utils.Cfg.ServiceSettings.EnableOutgoingWebhooks {
-		return nil, model.NewAppError("GetOutgoingWebhooksForTeamPage", "api.webhook.get_outgoing.disabled.app_error", nil, "", http.StatusNotImplemented)
+		return nil, model.NewAppError("GetOutgoingWebhooksForTeamPage", "api.outgoing_webhook.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
 	if result := <-Srv.Store.Webhook().GetOutgoingByTeam(teamId); result.Err != nil {
@@ -325,6 +333,10 @@ func GetOutgoingWebhooksForTeamPage(teamId string, page, perPage int) ([]*model.
 }
 
 func DeleteOutgoingWebhook(hookId string) *model.AppError {
+	if !utils.Cfg.ServiceSettings.EnableOutgoingWebhooks {
+		return model.NewAppError("DeleteOutgoingWebhook", "api.outgoing_webhook.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
 	if result := <-Srv.Store.Webhook().DeleteOutgoing(hookId, model.GetMillis()); result.Err != nil {
 		return result.Err
 	}
@@ -334,7 +346,7 @@ func DeleteOutgoingWebhook(hookId string) *model.AppError {
 
 func RegenOutgoingWebhookToken(hook *model.OutgoingWebhook) (*model.OutgoingWebhook, *model.AppError) {
 	if !utils.Cfg.ServiceSettings.EnableOutgoingWebhooks {
-		return nil, model.NewAppError("regenOutgoingHookToken", "api.webhook.regen_outgoing_token.disabled.app_error", nil, "", http.StatusNotImplemented)
+		return nil, model.NewAppError("RegenOutgoingWebhookToken", "api.outgoing_webhook.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
 	hook.Token = model.NewId()
