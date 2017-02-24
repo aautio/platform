@@ -7,13 +7,11 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"unicode/utf8"
 
 	l4g "github.com/alecthomas/log4go"
 	"github.com/gorilla/mux"
 	"github.com/mattermost/platform/app"
 	"github.com/mattermost/platform/model"
-	"github.com/mattermost/platform/store"
 	"github.com/mattermost/platform/utils"
 )
 
@@ -72,20 +70,6 @@ func createIncomingHook(c *Context, w http.ResponseWriter, r *http.Request) {
 }
 
 func deleteIncomingHook(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !utils.Cfg.ServiceSettings.EnableIncomingWebhooks {
-		c.Err = model.NewLocAppError("deleteIncomingHook", "api.webhook.delete_incoming.disabled.app_errror", nil, "")
-		c.Err.StatusCode = http.StatusNotImplemented
-		return
-	}
-
-	if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_WEBHOOKS) {
-		c.Err = model.NewLocAppError("deleteIncomingHook", "api.command.admin_only.app_error", nil, "")
-		c.Err.StatusCode = http.StatusForbidden
-		return
-	}
-
-	c.LogAudit("attempt")
-
 	props := model.MapFromJson(r.Body)
 
 	id := props["id"]
@@ -94,23 +78,30 @@ func deleteIncomingHook(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if result := <-app.Srv.Store.Webhook().GetIncoming(id, true); result.Err != nil {
-		c.Err = result.Err
-		return
-	} else {
-		if c.Session.UserId != result.Data.(*model.IncomingWebhook).UserId && !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_OTHERS_WEBHOOKS) {
-			c.LogAudit("fail - inappropriate permissions")
-			c.Err = model.NewLocAppError("deleteIncomingHook", "api.webhook.delete_incoming.permissions.app_errror", nil, "user_id="+c.Session.UserId)
-			return
-		}
-	}
-
-	if err := (<-app.Srv.Store.Webhook().DeleteIncoming(id, model.GetMillis())).Err; err != nil {
+	hook, err := app.GetIncomingWebhook(id)
+	if err != nil {
 		c.Err = err
 		return
 	}
 
-	app.InvalidateCacheForWebhook(id)
+	if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_WEBHOOKS) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_WEBHOOKS)
+		return
+	}
+
+	c.LogAudit("attempt")
+
+	if c.Session.UserId != hook.UserId && !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_OTHERS_WEBHOOKS) {
+		c.LogAudit("fail - inappropriate permissions")
+		c.SetPermissionError(model.PERMISSION_MANAGE_OTHERS_WEBHOOKS)
+		return
+	}
+
+	if err := app.DeleteIncomingWebhook(id); err != nil {
+		c.LogAudit("fail")
+		c.Err = err
+		return
+	}
 
 	c.LogAudit("success")
 	w.Write([]byte(model.MapToJson(props)))
@@ -131,102 +122,42 @@ func getIncomingHooks(c *Context, w http.ResponseWriter, r *http.Request) {
 }
 
 func createOutgoingHook(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !utils.Cfg.ServiceSettings.EnableOutgoingWebhooks {
-		c.Err = model.NewLocAppError("createOutgoingHook", "api.webhook.create_outgoing.disabled.app_error", nil, "")
-		c.Err.StatusCode = http.StatusNotImplemented
-		return
-	}
-
-	if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_WEBHOOKS) {
-		c.Err = model.NewLocAppError("createOutgoingHook", "api.command.admin_only.app_error", nil, "")
-		c.Err.StatusCode = http.StatusForbidden
-		return
-	}
-
-	c.LogAudit("attempt")
-
 	hook := model.OutgoingWebhookFromJson(r.Body)
-
 	if hook == nil {
 		c.SetInvalidParam("createOutgoingHook", "webhook")
 		return
 	}
 
-	hook.CreatorId = c.Session.UserId
+	c.LogAudit("attempt")
+
 	hook.TeamId = c.TeamId
+	hook.CreatorId = c.Session.UserId
 
-	if len(hook.ChannelId) != 0 {
-		cchan := app.Srv.Store.Channel().Get(hook.ChannelId, true)
-
-		var channel *model.Channel
-		if result := <-cchan; result.Err != nil {
-			c.Err = result.Err
-			return
-		} else {
-			channel = result.Data.(*model.Channel)
-		}
-
-		if channel.Type != model.CHANNEL_OPEN {
-			c.LogAudit("fail - not open channel")
-			c.Err = model.NewLocAppError("createOutgoingHook", "api.webhook.create_outgoing.not_open.app_error", nil, "")
-			return
-		}
-
-		if channel.Type != model.CHANNEL_OPEN || channel.TeamId != c.TeamId {
-			c.LogAudit("fail - bad channel permissions")
-			c.Err = model.NewLocAppError("createOutgoingHook", "api.webhook.create_outgoing.permissions.app_error", nil, "")
-			return
-		}
-	} else if len(hook.TriggerWords) == 0 {
-		c.Err = model.NewLocAppError("createOutgoingHook", "api.webhook.create_outgoing.triggers.app_error", nil, "")
+	if !app.SessionHasPermissionToTeam(c.Session, hook.TeamId, model.PERMISSION_MANAGE_WEBHOOKS) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_WEBHOOKS)
 		return
 	}
 
-	if result := <-app.Srv.Store.Webhook().GetOutgoingByTeam(c.TeamId); result.Err != nil {
-		c.Err = result.Err
-		return
-	} else {
-		allHooks := result.Data.([]*model.OutgoingWebhook)
-
-		for _, existingOutHook := range allHooks {
-			urlIntersect := utils.StringArrayIntersection(existingOutHook.CallbackURLs, hook.CallbackURLs)
-			triggerIntersect := utils.StringArrayIntersection(existingOutHook.TriggerWords, hook.TriggerWords)
-
-			if existingOutHook.ChannelId == hook.ChannelId && len(urlIntersect) != 0 && len(triggerIntersect) != 0 {
-				c.Err = model.NewLocAppError("createOutgoingHook", "api.webhook.create_outgoing.intersect.app_error", nil, "")
-				return
-			}
-		}
-	}
-
-	if result := <-app.Srv.Store.Webhook().SaveOutgoing(hook); result.Err != nil {
-		c.Err = result.Err
+	if rhook, err := app.CreateOutgoingWebhook(hook); err != nil {
+		c.LogAudit("fail")
+		c.Err = err
 		return
 	} else {
 		c.LogAudit("success")
-		rhook := result.Data.(*model.OutgoingWebhook)
 		w.Write([]byte(rhook.ToJson()))
 	}
 }
 
 func getOutgoingHooks(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !utils.Cfg.ServiceSettings.EnableOutgoingWebhooks {
-		c.Err = model.NewLocAppError("getOutgoingHooks", "api.webhook.get_outgoing.disabled.app_error", nil, "")
-		c.Err.StatusCode = http.StatusNotImplemented
-		return
-	}
-
 	if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_WEBHOOKS) {
-		c.Err = model.NewLocAppError("getOutgoingHooks", "api.command.admin_only.app_error", nil, "")
-		c.Err.StatusCode = http.StatusForbidden
+		c.SetPermissionError(model.PERMISSION_MANAGE_WEBHOOKS)
 		return
 	}
 
-	if result := <-app.Srv.Store.Webhook().GetOutgoingByTeam(c.TeamId); result.Err != nil {
-		c.Err = result.Err
+	if hooks, err := app.GetOutgoingWebhooksForTeamPage(c.TeamId, 0, 100); err != nil {
+		c.Err = err
 		return
 	} else {
-		hooks := result.Data.([]*model.OutgoingWebhook)
 		w.Write([]byte(model.OutgoingWebhookListToJson(hooks)))
 	}
 }
@@ -238,14 +169,6 @@ func deleteOutgoingHook(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_WEBHOOKS) {
-		c.Err = model.NewLocAppError("deleteOutgoingHook", "api.command.admin_only.app_error", nil, "")
-		c.Err.StatusCode = http.StatusForbidden
-		return
-	}
-
-	c.LogAudit("attempt")
-
 	props := model.MapFromJson(r.Body)
 
 	id := props["id"]
@@ -254,18 +177,27 @@ func deleteOutgoingHook(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if result := <-app.Srv.Store.Webhook().GetOutgoing(id); result.Err != nil {
-		c.Err = result.Err
+	c.LogAudit("attempt")
+
+	if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_WEBHOOKS) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_WEBHOOKS)
 		return
-	} else {
-		if c.Session.UserId != result.Data.(*model.OutgoingWebhook).CreatorId && !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_OTHERS_WEBHOOKS) {
-			c.LogAudit("fail - inappropriate permissions")
-			c.Err = model.NewLocAppError("deleteOutgoingHook", "api.webhook.delete_outgoing.permissions.app_error", nil, "user_id="+c.Session.UserId)
-			return
-		}
 	}
 
-	if err := (<-app.Srv.Store.Webhook().DeleteOutgoing(id, model.GetMillis())).Err; err != nil {
+	hook, err := app.GetOutgoingWebhook(id)
+	if err != nil {
+		c.Err = err
+		return
+	}
+
+	if c.Session.UserId != hook.CreatorId && !app.SessionHasPermissionToTeam(c.Session, hook.TeamId, model.PERMISSION_MANAGE_OTHERS_WEBHOOKS) {
+		c.LogAudit("fail - inappropriate permissions")
+		c.SetPermissionError(model.PERMISSION_MANAGE_OTHERS_WEBHOOKS)
+		return
+	}
+
+	if err := app.DeleteOutgoingWebhook(id); err != nil {
+		c.LogAudit("fail")
 		c.Err = err
 		return
 	}
@@ -275,20 +207,6 @@ func deleteOutgoingHook(c *Context, w http.ResponseWriter, r *http.Request) {
 }
 
 func regenOutgoingHookToken(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !utils.Cfg.ServiceSettings.EnableOutgoingWebhooks {
-		c.Err = model.NewLocAppError("regenOutgoingHookToken", "api.webhook.regen_outgoing_token.disabled.app_error", nil, "")
-		c.Err.StatusCode = http.StatusNotImplemented
-		return
-	}
-
-	if !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_WEBHOOKS) {
-		c.Err = model.NewLocAppError("regenOutgoingHookToken", "api.command.admin_only.app_error", nil, "")
-		c.Err.StatusCode = http.StatusForbidden
-		return
-	}
-
-	c.LogAudit("attempt")
-
 	props := model.MapFromJson(r.Body)
 
 	id := props["id"]
@@ -297,41 +215,36 @@ func regenOutgoingHookToken(c *Context, w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var hook *model.OutgoingWebhook
-	if result := <-app.Srv.Store.Webhook().GetOutgoing(id); result.Err != nil {
-		c.Err = result.Err
+	hook, err := app.GetOutgoingWebhook(id)
+	if err != nil {
+		c.Err = err
 		return
-	} else {
-		hook = result.Data.(*model.OutgoingWebhook)
-
-		if c.TeamId != hook.TeamId && c.Session.UserId != hook.CreatorId && !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_OTHERS_WEBHOOKS) {
-			c.LogAudit("fail - inappropriate permissions")
-			c.Err = model.NewLocAppError("regenOutgoingHookToken", "api.webhook.regen_outgoing_token.permissions.app_error", nil, "user_id="+c.Session.UserId)
-			return
-		}
 	}
 
-	hook.Token = model.NewId()
+	c.LogAudit("attempt")
 
-	if result := <-app.Srv.Store.Webhook().UpdateOutgoing(hook); result.Err != nil {
-		c.Err = result.Err
+	if !app.SessionHasPermissionToTeam(c.Session, hook.TeamId, model.PERMISSION_MANAGE_WEBHOOKS) {
+		c.SetPermissionError(model.PERMISSION_MANAGE_WEBHOOKS)
+		return
+	}
+
+	if c.TeamId != hook.TeamId && c.Session.UserId != hook.CreatorId && !app.SessionHasPermissionToTeam(c.Session, c.TeamId, model.PERMISSION_MANAGE_OTHERS_WEBHOOKS) {
+		c.LogAudit("fail - inappropriate permissions")
+		c.SetPermissionError(model.PERMISSION_MANAGE_OTHERS_WEBHOOKS)
+		return
+	}
+
+	if rhook, err := app.RegenOutgoingWebhookToken(hook); err != nil {
+		c.Err = err
 		return
 	} else {
-		w.Write([]byte(result.Data.(*model.OutgoingWebhook).ToJson()))
+		w.Write([]byte(rhook.ToJson()))
 	}
 }
 
 func incomingWebhook(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !utils.Cfg.ServiceSettings.EnableIncomingWebhooks {
-		c.Err = model.NewLocAppError("incomingWebhook", "web.incoming_webhook.disabled.app_error", nil, "")
-		c.Err.StatusCode = http.StatusNotImplemented
-		return
-	}
-
 	params := mux.Vars(r)
 	id := params["id"]
-
-	hchan := app.Srv.Store.Webhook().GetIncoming(id, true)
 
 	r.ParseForm()
 
@@ -362,117 +275,8 @@ func incomingWebhook(c *Context, w http.ResponseWriter, r *http.Request) {
 
 	parsedRequest := model.IncomingWebhookRequestFromJson(payload)
 
-	if parsedRequest == nil {
-		c.Err = model.NewLocAppError("incomingWebhook", "web.incoming_webhook.parse.app_error", nil, "")
-		return
-	}
-
-	text := parsedRequest.Text
-	if len(text) == 0 && parsedRequest.Attachments == nil {
-		c.Err = model.NewLocAppError("incomingWebhook", "web.incoming_webhook.text.app_error", nil, "")
-		c.Err.StatusCode = http.StatusBadRequest
-		return
-	}
-
-	textSize := utf8.RuneCountInString(text)
-	if textSize > model.POST_MESSAGE_MAX_RUNES {
-		c.Err = model.NewLocAppError("incomingWebhook", "web.incoming_webhook.text.length.app_error", map[string]interface{}{"Max": model.POST_MESSAGE_MAX_RUNES, "Actual": textSize}, "")
-		c.Err.StatusCode = http.StatusBadRequest
-		return
-	}
-
-	channelName := parsedRequest.ChannelName
-	webhookType := parsedRequest.Type
-
-	// attachments is in here for slack compatibility
-	if parsedRequest.Attachments != nil {
-		if len(parsedRequest.Props) == 0 {
-			parsedRequest.Props = make(model.StringInterface)
-		}
-		parsedRequest.Props["attachments"] = parsedRequest.Attachments
-
-		attachmentSize := utf8.RuneCountInString(model.StringInterfaceToJson(parsedRequest.Props))
-		// Minus 100 to leave room for setting post type in the Props
-		if attachmentSize > model.POST_PROPS_MAX_RUNES-100 {
-			c.Err = model.NewLocAppError("incomingWebhook", "web.incoming_webhook.attachment.app_error", map[string]interface{}{"Max": model.POST_PROPS_MAX_RUNES - 100, "Actual": attachmentSize}, "")
-			c.Err.StatusCode = http.StatusBadRequest
-			return
-		}
-
-		webhookType = model.POST_SLACK_ATTACHMENT
-	}
-
-	var hook *model.IncomingWebhook
-	if result := <-hchan; result.Err != nil {
-		c.Err = model.NewLocAppError("incomingWebhook", "web.incoming_webhook.invalid.app_error", nil, "err="+result.Err.Message)
-		return
-	} else {
-		hook = result.Data.(*model.IncomingWebhook)
-	}
-
-	var channel *model.Channel
-	var cchan store.StoreChannel
-	var directUserId string
-
-	if len(channelName) != 0 {
-		if channelName[0] == '@' {
-			if result := <-app.Srv.Store.User().GetByUsername(channelName[1:]); result.Err != nil {
-				c.Err = model.NewLocAppError("incomingWebhook", "web.incoming_webhook.user.app_error", nil, "err="+result.Err.Message)
-				return
-			} else {
-				directUserId = result.Data.(*model.User).Id
-				channelName = model.GetDMNameFromIds(directUserId, hook.UserId)
-			}
-		} else if channelName[0] == '#' {
-			channelName = channelName[1:]
-		}
-
-		cchan = app.Srv.Store.Channel().GetByName(hook.TeamId, channelName, true)
-	} else {
-		cchan = app.Srv.Store.Channel().Get(hook.ChannelId, true)
-	}
-
-	overrideUsername := parsedRequest.Username
-	overrideIconUrl := parsedRequest.IconURL
-
-	result := <-cchan
-	if result.Err != nil && result.Err.Id == store.MISSING_CHANNEL_ERROR && directUserId != "" {
-		newChanResult := <-app.Srv.Store.Channel().CreateDirectChannel(directUserId, hook.UserId)
-		if newChanResult.Err != nil {
-			c.Err = model.NewLocAppError("incomingWebhook", "web.incoming_webhook.channel.app_error", nil, "err="+newChanResult.Err.Message)
-			return
-		} else {
-			channel = newChanResult.Data.(*model.Channel)
-			app.InvalidateCacheForUser(directUserId)
-			app.InvalidateCacheForUser(hook.UserId)
-		}
-	} else if result.Err != nil {
-		c.Err = model.NewLocAppError("incomingWebhook", "web.incoming_webhook.channel.app_error", nil, "err="+result.Err.Message)
-		return
-	} else {
-		channel = result.Data.(*model.Channel)
-	}
-
-	// create a mock session
-	c.Session = model.Session{
-		UserId: hook.UserId,
-		TeamMembers: []*model.TeamMember{{
-			TeamId: hook.TeamId,
-			UserId: hook.UserId,
-			Roles:  model.ROLE_CHANNEL_USER.Id,
-		}},
-		IsOAuth: false,
-	}
-
-	c.TeamId = hook.TeamId
-
-	if channel.Type != model.CHANNEL_OPEN && !app.SessionHasPermissionToChannel(c.Session, channel.Id, model.PERMISSION_READ_CHANNEL) {
-		c.Err = model.NewLocAppError("incomingWebhook", "web.incoming_webhook.permissions.app_error", nil, "")
-		return
-	}
-	c.Err = nil
-
-	if _, err := app.CreateWebhookPost(hook.UserId, hook.TeamId, channel.Id, text, overrideUsername, overrideIconUrl, parsedRequest.Props, webhookType); err != nil {
+	err := app.HandleIncomingWebhook(id, parsedRequest)
+	if err != nil {
 		c.Err = err
 		return
 	}
